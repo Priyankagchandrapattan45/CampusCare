@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import "./App.css";
 
-const API = "http://127.0.0.1:5000";
+const API = "https://campuscare-7tc7.onrender.com";
 
 function CampusCareLogo({ compact = false, inverse = false }) {
   return (
