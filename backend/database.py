@@ -1,134 +1,261 @@
 import os
-import sqlite3
+
+from dotenv import load_dotenv
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
+from gridfs import GridFSBucket
 
 
 # =========================================================
-# DATABASE CONFIGURATION
+# LOAD ENVIRONMENT VARIABLES
 # =========================================================
 
-# Project root:
-# D:\Projects\Handson Project
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Use the main CampusCare database
-DATABASE_NAME = os.path.join(BASE_DIR, "campuscare.db")
+load_dotenv()
 
 
 # =========================================================
-# DATABASE CONNECTION
+# MONGODB CONFIGURATION
 # =========================================================
 
-def get_db_connection():
+MONGO_URI = os.getenv("MONGO_URI")
 
-    connection = sqlite3.connect(DATABASE_NAME)
+MONGO_DB_NAME = os.getenv(
+    "MONGO_DB_NAME",
+    "campuscare"
+)
 
-    connection.row_factory = sqlite3.Row
 
-    return connection
+if not MONGO_URI:
+    raise RuntimeError(
+        "MONGO_URI environment variable is not set."
+    )
 
 
 # =========================================================
-# CREATE TABLES
+# MONGODB CLIENT
+# =========================================================
+
+client = MongoClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=10000
+)
+
+db = client[MONGO_DB_NAME]
+
+
+# =========================================================
+# COLLECTIONS
+# =========================================================
+
+users_collection = db["users"]
+
+issues_collection = db["issues"]
+
+issue_images_collection = db["issue_images"]
+
+counters_collection = db["counters"]
+
+
+# =========================================================
+# GRIDFS
+# =========================================================
+
+gridfs_bucket = GridFSBucket(db)
+
+
+# =========================================================
+# DATABASE INITIALIZATION
 # =========================================================
 
 def create_tables():
 
-    connection = get_db_connection()
+    """
+    MongoDB does not require CREATE TABLE statements.
 
-    # -----------------------------------------------------
-    # USERS TABLE
-    # -----------------------------------------------------
+    This function creates useful indexes and checks
+    the MongoDB connection.
+    """
 
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
+    try:
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        # Test MongoDB connection
+        client.admin.command("ping")
 
-            name TEXT NOT NULL,
+        # -------------------------------------------------
+        # USERS INDEXES
+        # -------------------------------------------------
 
-            email TEXT NOT NULL UNIQUE,
-
-            password TEXT NOT NULL,
-
-            role TEXT NOT NULL DEFAULT 'student',
-
-            profile_image TEXT
-
+        users_collection.create_index(
+            [("email", ASCENDING)],
+            unique=True
         )
-        """
+
+        users_collection.create_index(
+            [("id", DESCENDING)]
+        )
+
+        # -------------------------------------------------
+        # ISSUES INDEXES
+        # -------------------------------------------------
+
+        issues_collection.create_index(
+            [("id", DESCENDING)]
+        )
+
+        issues_collection.create_index(
+            [("reported_by", ASCENDING)]
+        )
+
+        # -------------------------------------------------
+        # ISSUE IMAGES INDEXES
+        # -------------------------------------------------
+
+        issue_images_collection.create_index(
+            [("issue_id", ASCENDING)]
+        )
+
+        issue_images_collection.create_index(
+            [("id", ASCENDING)]
+        )
+
+        print("MongoDB connection successful!")
+        print(f"Database: {MONGO_DB_NAME}")
+
+    except Exception as error:
+
+        print("MongoDB connection failed!")
+        print(error)
+
+        raise
+
+
+# =========================================================
+# GET DATABASE
+# =========================================================
+
+def get_db_connection():
+
+    """
+    Compatibility function.
+
+    Returns the MongoDB database object.
+    """
+
+    return db
+
+
+# =========================================================
+# GENERATE INTEGER ID
+# =========================================================
+
+def get_next_id(collection_name):
+
+    """
+    Generates sequential integer IDs using a MongoDB
+    counters collection.
+
+    Example:
+
+    users:
+    1
+    2
+    3
+
+    issues:
+    1
+    2
+    3
+    """
+
+    counter = counters_collection.find_one_and_update(
+        {
+            "_id": collection_name
+        },
+        {
+            "$inc": {
+                "seq": 1
+            }
+        },
+        upsert=True,
+        return_document=True
     )
 
-    # Check whether profile_image already exists
-    user_columns = connection.execute(
-        "PRAGMA table_info(users)"
-    ).fetchall()
+    return counter["seq"]
 
-    if not any(column[1] == "profile_image" for column in user_columns):
 
-        connection.execute(
-            "ALTER TABLE users ADD COLUMN profile_image TEXT"
-        )
+# =========================================================
+# INITIALIZE COUNTERS
+# =========================================================
 
-    # -----------------------------------------------------
-    # ISSUES TABLE
-    # -----------------------------------------------------
+def initialize_counter(collection_name, collection):
 
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS issues (
+    """
+    If a collection already contains documents but the
+    counter does not exist, initialize the counter from
+    the highest existing ID.
+    """
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            title TEXT NOT NULL,
-
-            description TEXT NOT NULL,
-
-            category TEXT NOT NULL,
-
-            location TEXT NOT NULL,
-
-            priority TEXT NOT NULL DEFAULT 'Medium',
-
-            status TEXT NOT NULL DEFAULT 'Reported',
-
-            reported_by INTEGER NOT NULL,
-
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-            image_filename TEXT,
-
-            FOREIGN KEY (reported_by)
-            REFERENCES users(id)
-
-        )
-        """
+    existing_counter = counters_collection.find_one(
+        {
+            "_id": collection_name
+        }
     )
 
-    # -----------------------------------------------------
-    # ISSUE IMAGES TABLE
-    # -----------------------------------------------------
+    if existing_counter:
+        return
 
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS issue_images (
-
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            issue_id INTEGER NOT NULL,
-
-            image_filename TEXT NOT NULL,
-
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-            FOREIGN KEY (issue_id)
-            REFERENCES issues(id)
-            ON DELETE CASCADE
-
-        )
-        """
+    last_document = collection.find_one(
+        {},
+        sort=[
+            ("id", DESCENDING)
+        ]
     )
 
-    connection.commit()
+    if last_document:
 
-    connection.close()
+        highest_id = last_document.get(
+            "id",
+            0
+        )
+
+    else:
+
+        highest_id = 0
+
+    counters_collection.insert_one(
+        {
+            "_id": collection_name,
+            "seq": highest_id
+        }
+    )
+
+
+# =========================================================
+# INITIALIZE ALL COUNTERS
+# =========================================================
+
+def initialize_counters():
+
+    initialize_counter(
+        "users",
+        users_collection
+    )
+
+    initialize_counter(
+        "issues",
+        issues_collection
+    )
+
+    initialize_counter(
+        "issue_images",
+        issue_images_collection
+    )
+
+
+# =========================================================
+# START DATABASE
+# =========================================================
+
+create_tables()
+
+initialize_counters()

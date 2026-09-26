@@ -1,11 +1,36 @@
-from flask import Flask, jsonify, request, send_from_directory
-from flask_cors import CORS
-from werkzeug.utils import secure_filename
-from werkzeug.security import generate_password_hash, check_password_hash
+from flask import (
+    Flask,
+    jsonify,
+    request,
+    send_file
+)
 
-from database import get_db_connection, create_tables
+from flask_cors import CORS
+
+from werkzeug.utils import secure_filename
+
+from werkzeug.security import (
+    generate_password_hash,
+    check_password_hash
+)
+
+from database import (
+    create_tables,
+    users_collection,
+    issues_collection,
+    issue_images_collection,
+    gridfs_bucket,
+    get_next_id
+)
+
+from pymongo.errors import DuplicateKeyError
+
+from bson import ObjectId
+
+from io import BytesIO
 
 import os
+
 from datetime import datetime
 
 
@@ -22,19 +47,12 @@ CORS(app)
 # UPLOAD CONFIGURATION
 # =========================================================
 
-UPLOAD_FOLDER = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "uploads"
-)
-
 ALLOWED_EXTENSIONS = {
     "png",
     "jpg",
     "jpeg",
     "webp"
 }
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
 # =========================================================
@@ -52,7 +70,10 @@ def allowed_file(filename):
 
     return (
         "." in filename
-        and filename.rsplit(".", 1)[1].lower()
+        and filename.rsplit(
+            ".",
+            1
+        )[1].lower()
         in ALLOWED_EXTENSIONS
     )
 
@@ -87,20 +108,35 @@ def test_api():
 # REGISTER
 # =========================================================
 
-@app.route("/api/register", methods=["POST"])
+@app.route(
+    "/api/register",
+    methods=["POST"]
+)
 def register():
 
     data = request.get_json()
 
     if not data:
+
         return jsonify({
             "success": False,
             "message": "Invalid request data."
         }), 400
 
-    name = data.get("name", "").strip()
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
+    name = data.get(
+        "name",
+        ""
+    ).strip()
+
+    email = data.get(
+        "email",
+        ""
+    ).strip().lower()
+
+    password = data.get(
+        "password",
+        ""
+    )
 
     if not name or not email or not password:
 
@@ -109,51 +145,73 @@ def register():
             "message": "Name, email and password are required."
         }), 400
 
-    # Hash new passwords
-    hashed_password = generate_password_hash(password)
+    # -----------------------------------------------------
+    # HASH PASSWORD
+    # -----------------------------------------------------
 
-    connection = get_db_connection()
+    hashed_password = generate_password_hash(
+        password
+    )
+
+    # -----------------------------------------------------
+    # CREATE USER
+    # -----------------------------------------------------
+
+    user_id = get_next_id(
+        "users"
+    )
+
+    user_document = {
+
+        "id": user_id,
+
+        "name": name,
+
+        "email": email,
+
+        "password": hashed_password,
+
+        "role": "student",
+
+        "profile_image": None
+    }
 
     try:
 
-        connection.execute(
-            """
-            INSERT INTO users
-            (name, email, password, role)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                name,
-                email,
-                hashed_password,
-                "student"
-            )
+        users_collection.insert_one(
+            user_document
         )
-
-        connection.commit()
 
         return jsonify({
             "success": True,
             "message": "Account created successfully!"
         }), 201
 
-    except Exception as error:
+    except DuplicateKeyError:
 
         return jsonify({
             "success": False,
             "message": "Email already exists."
         }), 409
 
-    finally:
+    except Exception as error:
 
-        connection.close()
+        print("REGISTER ERROR:", error)
+
+        return jsonify({
+            "success": False,
+            "message": "Failed to create account."
+        }), 500
 
 
 # =========================================================
 # LOGIN
 # =========================================================
 
-@app.route("/api/login", methods=["POST"])
+@app.route(
+    "/api/login",
+    methods=["POST"]
+)
 def login():
 
     data = request.get_json()
@@ -165,8 +223,15 @@ def login():
             "message": "Invalid request data."
         }), 400
 
-    email = data.get("email", "").strip().lower()
-    password = data.get("password", "")
+    email = data.get(
+        "email",
+        ""
+    ).strip().lower()
+
+    password = data.get(
+        "password",
+        ""
+    )
 
     if not email or not password:
 
@@ -175,24 +240,15 @@ def login():
             "message": "Email and password are required."
         }), 400
 
-    connection = get_db_connection()
+    # -----------------------------------------------------
+    # FIND USER
+    # -----------------------------------------------------
 
-    user = connection.execute(
-        """
-        SELECT
-            id,
-            name,
-            email,
-            password,
-            role,
-            profile_image
-        FROM users
-        WHERE LOWER(email) = ?
-        """,
-        (email,)
-    ).fetchone()
-
-    connection.close()
+    user = users_collection.find_one(
+        {
+            "email": email
+        }
+    )
 
     if not user:
 
@@ -201,12 +257,15 @@ def login():
             "message": "Invalid email or password."
         }), 401
 
-    stored_password = user["password"]
+    stored_password = user.get(
+        "password",
+        ""
+    )
 
     password_valid = False
 
     # -----------------------------------------------------
-    # NEW HASHED PASSWORDS
+    # HASHED PASSWORD
     # -----------------------------------------------------
 
     try:
@@ -222,12 +281,9 @@ def login():
                 password
             )
 
-        # -------------------------------------------------
-        # OLD PLAIN-TEXT PASSWORDS
-        # -------------------------------------------------
-
         else:
 
+            # Old plain-text compatibility
             password_valid = (
                 stored_password == password
             )
@@ -243,16 +299,34 @@ def login():
             "message": "Invalid email or password."
         }), 401
 
+    # -----------------------------------------------------
+    # LOGIN SUCCESS
+    # -----------------------------------------------------
+
     return jsonify({
+
         "success": True,
+
         "message": "Login successful!",
+
         "user": {
-            "id": user["id"],
-            "name": user["name"],
-            "email": user["email"],
-            "role": user["role"],
-            "profile_image": user["profile_image"]
+
+            "id": user.get("id"),
+
+            "name": user.get("name"),
+
+            "email": user.get("email"),
+
+            "role": user.get(
+                "role",
+                "student"
+            ),
+
+            "profile_image": user.get(
+                "profile_image"
+            )
         }
+
     }), 200
 
 
@@ -260,26 +334,17 @@ def login():
 # GET USER PROFILE
 # =========================================================
 
-@app.route("/api/users/<int:user_id>", methods=["GET"])
+@app.route(
+    "/api/users/<int:user_id>",
+    methods=["GET"]
+)
 def get_user(user_id):
 
-    connection = get_db_connection()
-
-    user = connection.execute(
-        """
-        SELECT
-            id,
-            name,
-            email,
-            role,
-            profile_image
-        FROM users
-        WHERE id = ?
-        """,
-        (user_id,)
-    ).fetchone()
-
-    connection.close()
+    user = users_collection.find_one(
+        {
+            "id": user_id
+        }
+    )
 
     if not user:
 
@@ -289,8 +354,23 @@ def get_user(user_id):
         }), 404
 
     return jsonify({
+
         "success": True,
-        "user": dict(user)
+
+        "user": {
+
+            "id": user.get("id"),
+
+            "name": user.get("name"),
+
+            "email": user.get("email"),
+
+            "role": user.get("role"),
+
+            "profile_image": user.get(
+                "profile_image"
+            )
+        }
     })
 
 
@@ -298,7 +378,10 @@ def get_user(user_id):
 # UPDATE USER PROFILE
 # =========================================================
 
-@app.route("/api/users/<int:user_id>", methods=["PUT"])
+@app.route(
+    "/api/users/<int:user_id>",
+    methods=["PUT"]
+)
 def update_user(user_id):
 
     data = request.get_json()
@@ -310,8 +393,13 @@ def update_user(user_id):
             "message": "Invalid request data."
         }), 400
 
-    name = data.get("name")
-    email = data.get("email")
+    name = data.get(
+        "name"
+    )
+
+    email = data.get(
+        "email"
+    )
 
     if not name or not email:
 
@@ -320,89 +408,348 @@ def update_user(user_id):
             "message": "Name and email are required."
         }), 400
 
-    connection = get_db_connection()
+    name = name.strip()
 
-    try:
+    email = email.strip().lower()
 
-        connection.execute(
-            """
-            UPDATE users
-            SET name = ?, email = ?
-            WHERE id = ?
-            """,
-            (
-                name.strip(),
-                email.strip().lower(),
-                user_id
-            )
-        )
+    # -----------------------------------------------------
+    # CHECK EMAIL USED BY ANOTHER USER
+    # -----------------------------------------------------
 
-        connection.commit()
+    existing_user = users_collection.find_one({
 
-        return jsonify({
-            "success": True,
-            "message": "Profile updated successfully."
-        })
+        "email": email,
 
-    except Exception:
+        "id": {
+            "$ne": user_id
+        }
+    })
+
+    if existing_user:
 
         return jsonify({
             "success": False,
             "message": "Email may already be in use."
         }), 409
 
-    finally:
+    result = users_collection.update_one(
 
-        connection.close()
+        {
+            "id": user_id
+        },
+
+        {
+            "$set": {
+
+                "name": name,
+
+                "email": email
+            }
+        }
+    )
+
+    if result.matched_count == 0:
+
+        return jsonify({
+            "success": False,
+            "message": "User not found."
+        }), 404
+
+    return jsonify({
+
+        "success": True,
+
+        "message": "Profile updated successfully."
+    })
 
 
 # =========================================================
 # GET ALL USERS
 # =========================================================
 
-@app.route("/api/users", methods=["GET"])
+@app.route(
+    "/api/users",
+    methods=["GET"]
+)
 def get_users():
 
-    connection = get_db_connection()
+    users = users_collection.find(
+        {},
+        {
+            "_id": 0,
 
-    users = connection.execute(
-        """
-        SELECT
-            id,
-            name,
-            email,
-            role,
-            profile_image
-        FROM users
-        ORDER BY id DESC
-        """
-    ).fetchall()
+            "id": 1,
 
-    connection.close()
+            "name": 1,
 
-    return jsonify([
-        dict(user)
-        for user in users
-    ])
+            "email": 1,
+
+            "role": 1,
+
+            "profile_image": 1
+        }
+    ).sort(
+        "id",
+        -1
+    )
+
+    result = list(users)
+
+    return jsonify(result)
+
+
+# =========================================================
+# PROFILE IMAGE - UPLOAD
+# =========================================================
+
+@app.route(
+    "/api/users/<int:user_id>/profile-image",
+    methods=["POST"]
+)
+def upload_profile_image(user_id):
+
+    user = users_collection.find_one(
+        {
+            "id": user_id
+        }
+    )
+
+    if not user:
+
+        return jsonify({
+            "success": False,
+            "message": "User not found."
+        }), 404
+
+    if "image" not in request.files:
+
+        return jsonify({
+            "success": False,
+            "message": "No image provided."
+        }), 400
+
+    image = request.files["image"]
+
+    if not image or not image.filename:
+
+        return jsonify({
+            "success": False,
+            "message": "No image selected."
+        }), 400
+
+    if not allowed_file(
+        image.filename
+    ):
+
+        return jsonify({
+            "success": False,
+            "message": "Invalid image format."
+        }), 400
+
+    # -----------------------------------------------------
+    # DELETE OLD PROFILE IMAGE
+    # -----------------------------------------------------
+
+    old_filename = user.get(
+        "profile_image"
+    )
+
+    if old_filename:
+
+        try:
+
+            old_files = gridfs_bucket.find(
+                {
+                    "filename": old_filename
+                }
+            )
+
+            for old_file in old_files:
+
+                try:
+
+                    gridfs_bucket.delete(
+                        old_file._id
+                    )
+
+                except Exception:
+
+                    pass
+
+        except Exception:
+
+            pass
+
+    # -----------------------------------------------------
+    # CREATE UNIQUE FILE NAME
+    # -----------------------------------------------------
+
+    original_filename = secure_filename(
+        image.filename
+    )
+
+    timestamp = datetime.now().strftime(
+        "%Y%m%d%H%M%S%f"
+    )
+
+    filename = (
+        timestamp
+        + "_profile_"
+        + original_filename
+    )
+
+    # -----------------------------------------------------
+    # SAVE TO GRIDFS
+    # -----------------------------------------------------
+
+    file_id = gridfs_bucket.upload_from_stream(
+        filename,
+        image,
+        metadata={
+            "user_id": user_id,
+            "type": "profile_image"
+        }
+    )
+
+    # -----------------------------------------------------
+    # UPDATE USER
+    # -----------------------------------------------------
+
+    users_collection.update_one(
+
+        {
+            "id": user_id
+        },
+
+        {
+            "$set": {
+                "profile_image": filename
+            }
+        }
+    )
+
+    return jsonify({
+
+        "success": True,
+
+        "message": "Profile image uploaded successfully.",
+
+        "profile_image": filename
+    })
+
+
+# =========================================================
+# PROFILE IMAGE - DELETE
+# =========================================================
+
+@app.route(
+    "/api/users/<int:user_id>/profile-image",
+    methods=["DELETE"]
+)
+def delete_profile_image(user_id):
+
+    user = users_collection.find_one(
+        {
+            "id": user_id
+        }
+    )
+
+    if not user:
+
+        return jsonify({
+            "success": False,
+            "message": "User not found."
+        }), 404
+
+    filename = user.get(
+        "profile_image"
+    )
+
+    if filename:
+
+        try:
+
+            files = gridfs_bucket.find(
+                {
+                    "filename": filename
+                }
+            )
+
+            for file in files:
+
+                try:
+
+                    gridfs_bucket.delete(
+                        file._id
+                    )
+
+                except Exception:
+
+                    pass
+
+        except Exception:
+
+            pass
+
+    users_collection.update_one(
+
+        {
+            "id": user_id
+        },
+
+        {
+            "$set": {
+                "profile_image": None
+            }
+        }
+    )
+
+    return jsonify({
+
+        "success": True,
+
+        "message": "Profile image removed successfully."
+    })
 
 
 # =========================================================
 # CREATE ISSUE
 # =========================================================
 
-@app.route("/api/issues", methods=["POST"])
+@app.route(
+    "/api/issues",
+    methods=["POST"]
+)
 def create_issue():
 
-    title = request.form.get("title", "").strip()
-    description = request.form.get("description", "").strip()
-    category = request.form.get("category", "").strip()
-    location = request.form.get("location", "").strip()
+    title = request.form.get(
+        "title",
+        ""
+    ).strip()
+
+    description = request.form.get(
+        "description",
+        ""
+    ).strip()
+
+    category = request.form.get(
+        "category",
+        ""
+    ).strip()
+
+    location = request.form.get(
+        "location",
+        ""
+    ).strip()
+
     priority = request.form.get(
         "priority",
         "Medium"
     ).strip()
 
-    reported_by = request.form.get("reported_by")
+    reported_by = request.form.get(
+        "reported_by"
+    )
 
     if (
         not title
@@ -417,7 +764,59 @@ def create_issue():
             "message": "Please fill all required fields."
         }), 400
 
+    # -----------------------------------------------------
+    # CHECK USER
+    # -----------------------------------------------------
+
+    try:
+
+        reported_by = int(
+            reported_by
+        )
+
+    except ValueError:
+
+        return jsonify({
+            "success": False,
+            "message": "Invalid user ID."
+        }), 400
+
+    user = users_collection.find_one(
+        {
+            "id": reported_by
+        }
+    )
+
+    if not user:
+
+        return jsonify({
+            "success": False,
+            "message": "Reporting user not found."
+        }), 404
+
+    # -----------------------------------------------------
+    # VALIDATE PRIORITY
+    # -----------------------------------------------------
+
+    allowed_priorities = [
+        "Low",
+        "Medium",
+        "High"
+    ]
+
+    if priority not in allowed_priorities:
+
+        priority = "Medium"
+
     image_filename = None
+
+    # -----------------------------------------------------
+    # CREATE ISSUE ID
+    # -----------------------------------------------------
+
+    issue_id = get_next_id(
+        "issues"
+    )
 
     # -----------------------------------------------------
     # OPTIONAL IMAGE
@@ -429,7 +828,9 @@ def create_issue():
 
         if image and image.filename:
 
-            if not allowed_file(image.filename):
+            if not allowed_file(
+                image.filename
+            ):
 
                 return jsonify({
                     "success": False,
@@ -446,137 +847,189 @@ def create_issue():
 
             image_filename = (
                 timestamp
-                + "_"
+                + "_issue_"
                 + original_filename
             )
 
-            image.save(
-                os.path.join(
-                    UPLOAD_FOLDER,
-                    image_filename
-                )
+            # -------------------------------------------------
+            # SAVE IMAGE TO GRIDFS
+            # -------------------------------------------------
+
+            gridfs_bucket.upload_from_stream(
+
+                image_filename,
+
+                image,
+
+                metadata={
+
+                    "issue_id": issue_id,
+
+                    "reported_by": reported_by,
+
+                    "type": "issue_image"
+                }
             )
 
-    connection = get_db_connection()
+    # -----------------------------------------------------
+    # CREATE ISSUE DOCUMENT
+    # -----------------------------------------------------
+
+    issue_document = {
+
+        "id": issue_id,
+
+        "title": title,
+
+        "description": description,
+
+        "category": category,
+
+        "location": location,
+
+        "priority": priority,
+
+        "status": "Reported",
+
+        "reported_by": reported_by,
+
+        "created_at": datetime.now().isoformat(
+            timespec="seconds"
+        ),
+
+        "image_filename": image_filename
+    }
 
     try:
 
-        cursor = connection.execute(
-            """
-            INSERT INTO issues
-            (
-                title,
-                description,
-                category,
-                location,
-                priority,
-                status,
-                reported_by,
-                image_filename
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                title,
-                description,
-                category,
-                location,
-                priority,
-                "Reported",
-                int(reported_by),
-                image_filename
-            )
+        issues_collection.insert_one(
+            issue_document
         )
 
-        issue_id = cursor.lastrowid
-
         # -------------------------------------------------
-        # SAVE IMAGE IN issue_images TABLE TOO
+        # SAVE IMAGE RECORD
         # -------------------------------------------------
 
         if image_filename:
 
-            connection.execute(
-                """
-                INSERT INTO issue_images
-                (
-                    issue_id,
-                    image_filename
-                )
-                VALUES (?, ?)
-                """,
-                (
-                    issue_id,
-                    image_filename
-                )
+            image_id = get_next_id(
+                "issue_images"
             )
 
-        connection.commit()
+            issue_images_collection.insert_one({
+
+                "id": image_id,
+
+                "issue_id": issue_id,
+
+                "image_filename": image_filename,
+
+                "created_at": datetime.now().isoformat(
+                    timespec="seconds"
+                )
+            })
 
         return jsonify({
+
             "success": True,
+
             "message": "Issue reported successfully!",
+
             "issue_id": issue_id
+
         }), 201
 
     except Exception as error:
 
-        connection.rollback()
+        print(
+            "CREATE ISSUE ERROR:",
+            error
+        )
 
         return jsonify({
+
             "success": False,
+
             "message": "Failed to create issue.",
+
             "error": str(error)
+
         }), 500
-
-    finally:
-
-        connection.close()
 
 
 # =========================================================
 # GET MY ISSUES
 # =========================================================
 
-@app.route("/api/issues/<int:user_id>", methods=["GET"])
+@app.route(
+    "/api/issues/<int:user_id>",
+    methods=["GET"]
+)
 def get_my_issues(user_id):
 
-    connection = get_db_connection()
+    issues = issues_collection.find({
 
-    issues = connection.execute(
-        """
-        SELECT
-            id,
-            title,
-            description,
-            category,
-            location,
-            priority,
-            status,
-            reported_by,
-            created_at,
-            image_filename
-        FROM issues
-        WHERE reported_by = ?
-        ORDER BY id DESC
-        """,
-        (user_id,)
-    ).fetchall()
+        "reported_by": user_id
+
+    }).sort(
+        "id",
+        -1
+    )
 
     result = []
 
     for issue in issues:
 
-        issue_data = dict(issue)
+        issue_data = {
+
+            "id": issue.get("id"),
+
+            "title": issue.get("title"),
+
+            "description": issue.get(
+                "description"
+            ),
+
+            "category": issue.get(
+                "category"
+            ),
+
+            "location": issue.get(
+                "location"
+            ),
+
+            "priority": issue.get(
+                "priority"
+            ),
+
+            "status": issue.get(
+                "status"
+            ),
+
+            "reported_by": issue.get(
+                "reported_by"
+            ),
+
+            "created_at": issue.get(
+                "created_at"
+            ),
+
+            "image_filename": issue.get(
+                "image_filename"
+            )
+        }
 
         # -------------------------------------------------
         # MAIN IMAGE URL
         # -------------------------------------------------
 
-        if issue_data.get("image_filename"):
+        if issue_data.get(
+            "image_filename"
+        ):
 
             issue_data["image_url"] = (
-                "http://127.0.0.1:5000/uploads/"
+                request.host_url.rstrip("/")
+                + "/uploads/"
                 + issue_data["image_filename"]
             )
 
@@ -588,29 +1041,37 @@ def get_my_issues(user_id):
         # GET MULTIPLE IMAGES
         # -------------------------------------------------
 
-        images = connection.execute(
-            """
-            SELECT image_filename
-            FROM issue_images
-            WHERE issue_id = ?
-            ORDER BY id ASC
-            """,
-            (issue["id"],)
-        ).fetchall()
+        images = issue_images_collection.find({
+
+            "issue_id": issue.get("id")
+
+        }).sort(
+            "id",
+            1
+        )
 
         issue_data["images"] = [
+
             {
-                "filename": image["image_filename"],
+
+                "filename": image.get(
+                    "image_filename"
+                ),
+
                 "url":
-                    "http://127.0.0.1:5000/uploads/"
-                    + image["image_filename"]
+                    request.host_url.rstrip("/")
+                    + "/uploads/"
+                    + image.get(
+                        "image_filename"
+                    )
             }
+
             for image in images
         ]
 
-        result.append(issue_data)
-
-    connection.close()
+        result.append(
+            issue_data
+        )
 
     return jsonify(result)
 
@@ -619,43 +1080,89 @@ def get_my_issues(user_id):
 # GET ALL ISSUES
 # =========================================================
 
-@app.route("/api/issues", methods=["GET"])
+@app.route(
+    "/api/issues",
+    methods=["GET"]
+)
 def get_all_issues():
 
-    connection = get_db_connection()
-
-    issues = connection.execute(
-        """
-        SELECT
-            issues.id,
-            issues.title,
-            issues.description,
-            issues.category,
-            issues.location,
-            issues.priority,
-            issues.status,
-            issues.reported_by,
-            issues.created_at,
-            issues.image_filename,
-            users.name AS user_name,
-            users.email AS user_email
-        FROM issues
-        LEFT JOIN users
-        ON issues.reported_by = users.id
-        ORDER BY issues.id DESC
-        """
-    ).fetchall()
+    issues = issues_collection.find().sort(
+        "id",
+        -1
+    )
 
     result = []
 
     for issue in issues:
 
-        issue_data = dict(issue)
+        reported_by = issue.get(
+            "reported_by"
+        )
 
-        if issue_data.get("image_filename"):
+        user = users_collection.find_one({
+
+            "id": reported_by
+
+        })
+
+        issue_data = {
+
+            "id": issue.get("id"),
+
+            "title": issue.get("title"),
+
+            "description": issue.get(
+                "description"
+            ),
+
+            "category": issue.get(
+                "category"
+            ),
+
+            "location": issue.get(
+                "location"
+            ),
+
+            "priority": issue.get(
+                "priority"
+            ),
+
+            "status": issue.get(
+                "status"
+            ),
+
+            "reported_by": reported_by,
+
+            "created_at": issue.get(
+                "created_at"
+            ),
+
+            "image_filename": issue.get(
+                "image_filename"
+            ),
+
+            "user_name":
+                user.get("name")
+                if user
+                else None,
+
+            "user_email":
+                user.get("email")
+                if user
+                else None
+        }
+
+        # -------------------------------------------------
+        # MAIN IMAGE URL
+        # -------------------------------------------------
+
+        if issue_data.get(
+            "image_filename"
+        ):
 
             issue_data["image_url"] = (
-                "http://127.0.0.1:5000/uploads/"
+                request.host_url.rstrip("/")
+                + "/uploads/"
                 + issue_data["image_filename"]
             )
 
@@ -663,29 +1170,41 @@ def get_all_issues():
 
             issue_data["image_url"] = None
 
-        images = connection.execute(
-            """
-            SELECT image_filename
-            FROM issue_images
-            WHERE issue_id = ?
-            ORDER BY id ASC
-            """,
-            (issue["id"],)
-        ).fetchall()
+        # -------------------------------------------------
+        # MULTIPLE IMAGES
+        # -------------------------------------------------
+
+        images = issue_images_collection.find({
+
+            "issue_id": issue.get("id")
+
+        }).sort(
+            "id",
+            1
+        )
 
         issue_data["images"] = [
+
             {
-                "filename": image["image_filename"],
+
+                "filename": image.get(
+                    "image_filename"
+                ),
+
                 "url":
-                    "http://127.0.0.1:5000/uploads/"
-                    + image["image_filename"]
+                    request.host_url.rstrip("/")
+                    + "/uploads/"
+                    + image.get(
+                        "image_filename"
+                    )
             }
+
             for image in images
         ]
 
-        result.append(issue_data)
-
-    connection.close()
+        result.append(
+            issue_data
+        )
 
     return jsonify(result)
 
@@ -702,51 +1221,60 @@ def update_issue_status(issue_id):
 
     data = request.get_json()
 
-    status = data.get("status") if data else None
+    status = (
+        data.get("status")
+        if data
+        else None
+    )
 
     allowed_statuses = [
+
         "Reported",
+
         "In Progress",
+
         "Resolved"
     ]
 
     if status not in allowed_statuses:
 
         return jsonify({
+
             "success": False,
+
             "message": "Invalid status."
+
         }), 400
 
-    connection = get_db_connection()
+    result = issues_collection.update_one(
 
-    cursor = connection.execute(
-        """
-        UPDATE issues
-        SET status = ?
-        WHERE id = ?
-        """,
-        (
-            status,
-            issue_id
-        )
+        {
+            "id": issue_id
+        },
+
+        {
+            "$set": {
+                "status": status
+            }
+        }
     )
 
-    connection.commit()
-
-    updated = cursor.rowcount
-
-    connection.close()
-
-    if updated == 0:
+    if result.matched_count == 0:
 
         return jsonify({
+
             "success": False,
+
             "message": "Issue not found."
+
         }), 404
 
     return jsonify({
+
         "success": True,
-        "message": "Issue status updated successfully."
+
+        "message":
+            "Issue status updated successfully."
     })
 
 
@@ -760,7 +1288,9 @@ def update_issue_status(issue_id):
 )
 def admin_update_issue_status(issue_id):
 
-    return update_issue_status(issue_id)
+    return update_issue_status(
+        issue_id
+    )
 
 
 # =========================================================
@@ -775,51 +1305,60 @@ def update_issue_priority(issue_id):
 
     data = request.get_json()
 
-    priority = data.get("priority") if data else None
+    priority = (
+        data.get("priority")
+        if data
+        else None
+    )
 
     allowed_priorities = [
+
         "Low",
+
         "Medium",
+
         "High"
     ]
 
     if priority not in allowed_priorities:
 
         return jsonify({
+
             "success": False,
+
             "message": "Invalid priority."
+
         }), 400
 
-    connection = get_db_connection()
+    result = issues_collection.update_one(
 
-    cursor = connection.execute(
-        """
-        UPDATE issues
-        SET priority = ?
-        WHERE id = ?
-        """,
-        (
-            priority,
-            issue_id
-        )
+        {
+            "id": issue_id
+        },
+
+        {
+            "$set": {
+                "priority": priority
+            }
+        }
     )
 
-    connection.commit()
-
-    updated = cursor.rowcount
-
-    connection.close()
-
-    if updated == 0:
+    if result.matched_count == 0:
 
         return jsonify({
+
             "success": False,
+
             "message": "Issue not found."
+
         }), 404
 
     return jsonify({
+
         "success": True,
-        "message": "Issue priority updated successfully."
+
+        "message":
+            "Issue priority updated successfully."
     })
 
 
@@ -833,7 +1372,9 @@ def update_issue_priority(issue_id):
 )
 def admin_update_issue_priority(issue_id):
 
-    return update_issue_priority(issue_id)
+    return update_issue_priority(
+        issue_id
+    )
 
 
 # =========================================================
@@ -846,106 +1387,220 @@ def admin_update_issue_priority(issue_id):
 )
 def delete_issue(issue_id):
 
-    connection = get_db_connection()
+    # -----------------------------------------------------
+    # FIND ISSUE
+    # -----------------------------------------------------
 
-    # Get issue image
-    issue = connection.execute(
-        """
-        SELECT image_filename
-        FROM issues
-        WHERE id = ?
-        """,
-        (issue_id,)
-    ).fetchone()
+    issue = issues_collection.find_one({
+
+        "id": issue_id
+    })
 
     if not issue:
 
-        connection.close()
-
         return jsonify({
+
             "success": False,
+
             "message": "Issue not found."
+
         }), 404
 
-    # Get all images
-    images = connection.execute(
-        """
-        SELECT image_filename
-        FROM issue_images
-        WHERE issue_id = ?
-        """,
-        (issue_id,)
-    ).fetchall()
-
-    # Delete issue_images records
-    connection.execute(
-        """
-        DELETE FROM issue_images
-        WHERE issue_id = ?
-        """,
-        (issue_id,)
-    )
-
-    # Delete issue
-    connection.execute(
-        """
-        DELETE FROM issues
-        WHERE id = ?
-        """,
-        (issue_id,)
-    )
-
-    connection.commit()
-
-    connection.close()
-
-    # Delete physical files
     filenames = []
 
-    if issue["image_filename"]:
+    # -----------------------------------------------------
+    # MAIN IMAGE
+    # -----------------------------------------------------
+
+    main_image = issue.get(
+        "image_filename"
+    )
+
+    if main_image:
+
         filenames.append(
-            issue["image_filename"]
+            main_image
         )
+
+    # -----------------------------------------------------
+    # FIND ALL IMAGE RECORDS
+    # -----------------------------------------------------
+
+    images = list(
+        issue_images_collection.find({
+
+            "issue_id": issue_id
+        })
+    )
 
     for image in images:
 
-        if image["image_filename"] not in filenames:
+        filename = image.get(
+            "image_filename"
+        )
+
+        if (
+            filename
+            and filename not in filenames
+        ):
 
             filenames.append(
-                image["image_filename"]
+                filename
             )
+
+    # -----------------------------------------------------
+    # DELETE IMAGE RECORDS
+    # -----------------------------------------------------
+
+    issue_images_collection.delete_many({
+
+        "issue_id": issue_id
+    })
+
+    # -----------------------------------------------------
+    # DELETE ISSUE
+    # -----------------------------------------------------
+
+    issues_collection.delete_one({
+
+        "id": issue_id
+    })
+
+    # -----------------------------------------------------
+    # DELETE FILES FROM GRIDFS
+    # -----------------------------------------------------
 
     for filename in filenames:
 
-        file_path = os.path.join(
-            UPLOAD_FOLDER,
-            filename
-        )
+        try:
 
-        if os.path.exists(file_path):
+            files = gridfs_bucket.find({
 
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
+                "filename": filename
+            })
+
+            for file in files:
+
+                try:
+
+                    gridfs_bucket.delete(
+                        file._id
+                    )
+
+                except Exception:
+
+                    pass
+
+        except Exception:
+
+            pass
 
     return jsonify({
+
         "success": True,
+
         "message": "Issue deleted successfully."
     })
 
 
 # =========================================================
-# SERVE UPLOADED IMAGES
+# SERVE MONGODB GRIDFS IMAGES
 # =========================================================
 
-@app.route("/uploads/<filename>")
+@app.route(
+    "/uploads/<path:filename>"
+)
 def uploaded_file(filename):
 
-    return send_from_directory(
-        UPLOAD_FOLDER,
-        filename
-    )
+    try:
+
+        files = gridfs_bucket.find({
+
+            "filename": filename
+        })
+
+        file = next(
+            files,
+            None
+        )
+
+        if not file:
+
+            return jsonify({
+
+                "success": False,
+
+                "message": "Image not found."
+
+            }), 404
+
+        # -------------------------------------------------
+        # READ FILE FROM GRIDFS
+        # -------------------------------------------------
+
+        output = BytesIO()
+
+        gridfs_bucket.download_to_stream(
+            file._id,
+            output
+        )
+
+        output.seek(0)
+
+        # -------------------------------------------------
+        # DETERMINE MIME TYPE
+        # -------------------------------------------------
+
+        extension = filename.rsplit(
+            ".",
+            1
+        )[-1].lower()
+
+        mime_types = {
+
+            "png":
+                "image/png",
+
+            "jpg":
+                "image/jpeg",
+
+            "jpeg":
+                "image/jpeg",
+
+            "webp":
+                "image/webp"
+        }
+
+        mimetype = mime_types.get(
+
+            extension,
+
+            "application/octet-stream"
+        )
+
+        return send_file(
+
+            output,
+
+            mimetype=mimetype,
+
+            download_name=filename
+        )
+
+    except Exception as error:
+
+        print(
+            "IMAGE ERROR:",
+            error
+        )
+
+        return jsonify({
+
+            "success": False,
+
+            "message": "Unable to load image."
+
+        }), 500
 
 
 # =========================================================
@@ -955,7 +1610,10 @@ def uploaded_file(filename):
 if __name__ == "__main__":
 
     app.run(
+
         debug=True,
+
         host="127.0.0.1",
+
         port=5000
     )
